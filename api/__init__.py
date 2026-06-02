@@ -17,6 +17,7 @@ Supported Models:
 import base64
 import json
 import os
+import re
 import time
 import tempfile
 from io import BytesIO
@@ -54,11 +55,12 @@ BASE_URL = "https://apihub.agnes-ai.com/v1"
 
 CHAT_MODEL = "agnes-2.0-flash"
 IMAGE_MODEL = "agnes-image-2.1-flash"
-VIDEO_MODEL = "agnes-video-v2.0"
+VIDEO_MODEL = "agnes-video-v2"
 
 DEFAULT_SIZE = "1024x1024"
 DEFAULT_VIDEO_FRAMES = 121
 DEFAULT_VIDEO_FPS = 24
+VIDEO_TIMEOUT = 600  # video generation can take 2-5 minutes
 
 AVAILABLE_CHAT_MODELS = [CHAT_MODEL]
 AVAILABLE_IMAGE_MODELS = [IMAGE_MODEL]
@@ -136,6 +138,11 @@ def download_url_to_bytes(url: str, timeout: int = 120) -> Optional[bytes]:
 class AgnesClient:
     """Unified client for all Agnes AI API endpoints."""
 
+    # HTTP statuses that trigger an automatic retry.
+    _RETRY_STATUSES = {429, 500, 502, 503, 504, 524}
+    _MAX_RETRIES = 3
+    _RETRY_BASE_DELAY = 3  # seconds (exponential backoff: 3, 6, 12)
+
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.session = requests.Session()
@@ -143,6 +150,109 @@ class AgnesClient:
             "Authorization": api_key,
             "Content-Type": "application/json",
         })
+
+    # ------------------------------------------------------------------
+    # Error helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_error(status_code: int, body_text: str, api_name: str = "API") -> str:
+        """Parse an error response and return a clean, human-readable message."""
+        text = body_text.strip() if body_text else ""
+
+        # Cloudflare HTML error page
+        if text.startswith("<!DOCTYPE") or text.startswith("<html"):
+            # Try to extract Cloudflare error info
+            title_match = re.search(r"<title>[^<]*?(\d{3}):\s*([^<]*)</title>", text)
+            if title_match:
+                code = title_match.group(1)
+                desc = title_match.group(2)
+            else:
+                code = str(status_code)
+                desc = "server error"
+
+            # Map Cloudflare codes to Chinese messages
+            cf_map = {
+                "520": "服务器返回未知错误",
+                "521": "服务器已宕机",
+                "522": "连接超时（服务器未响应）",
+                "523": "服务器不可达",
+                "524": "服务器处理超时（任务过重）",
+                "525": "SSL 握手失败",
+                "526": "SSL 证书无效",
+                "530": "服务器错误",
+            }
+
+            extra = cf_map.get(code, desc)
+            return (
+                f"[{api_name} 错误] 服务器 {extra} (HTTP {status_code})。\n"
+                f"原因：Agnes AI 服务器繁忙或请求处理超时。\n"
+                f"建议：稍等 1-2 分钟后重试。"
+            )
+
+        # JSON error response
+        try:
+            if text:
+                error_data = json.loads(text)
+                error_msg = error_data.get("error", {}).get("message", "")
+                if not error_msg and isinstance(error_data.get("error"), str):
+                    error_msg = error_data["error"]
+                if error_msg:
+                    return f"[{api_name} 错误] {error_msg} (HTTP {status_code})"
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Fallback: truncate long responses
+        if len(text) > 300:
+            text = text[:300] + "..."
+        return f"[{api_name} 错误] HTTP {status_code}: {text}" if text else f"[{api_name} 错误] HTTP {status_code}"
+
+    def _request_with_retry(self, method: str, url: str, api_name: str,
+                            json_payload: dict = None, timeout: int = 300) -> requests.Response:
+        """Make an HTTP request with automatic retry on transient server errors."""
+        last_error = None
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                if method == "POST":
+                    resp = self.session.post(url, json=json_payload, timeout=timeout)
+                else:
+                    resp = self.session.get(url, timeout=timeout)
+
+                if resp.status_code == 200:
+                    return resp
+
+                if resp.status_code in self._RETRY_STATUSES and attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    last_error = (resp.status_code, resp.text)
+                    time.sleep(delay)
+                    continue
+
+                # Not retryable or last attempt → raise
+                raise RuntimeError(self._clean_error(resp.status_code, resp.text, api_name))
+
+            except requests.exceptions.Timeout:
+                if attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"[{api_name} 错误] 请求超时 (>{timeout}秒)。\n"
+                    f"建议：Agnes 服务器可能繁忙，请稍后重试。"
+                )
+            except requests.exceptions.ConnectionError:
+                if attempt < self._MAX_RETRIES:
+                    delay = self._RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"[{api_name} 错误] 无法连接到 Agnes 服务器。\n"
+                    f"建议：请检查网络连接或访问 https://platform.agnes-ai.com/ 确认服务状态。"
+                )
+
+        # Should not reach here, but handle gracefully
+        if last_error:
+            raise RuntimeError(self._clean_error(last_error[0], last_error[1], api_name))
+        raise RuntimeError(f"[{api_name} 错误] 请求失败（已重试 {self._MAX_RETRIES} 次）")
 
     # ------------------------------------------------------------------
     # Chat / LLM
@@ -156,19 +266,7 @@ class AgnesClient:
         max_tokens: int = 4096,
         stream: bool = False,
     ) -> str:
-        """
-        Call the chat completions endpoint.
-
-        Args:
-            messages: OpenAI-format message list.
-            model: Model identifier.
-            temperature: Sampling temperature.
-            max_tokens: Maximum output tokens.
-            stream: Whether to stream (returns full text for simplicity).
-
-        Returns:
-            The assistant's text response.
-        """
+        """Call the chat completions endpoint."""
         url = f"{BASE_URL}/chat/completions"
         payload = {
             "model": model,
@@ -177,15 +275,13 @@ class AgnesClient:
             "max_tokens": max_tokens,
             "stream": stream,
         }
-        resp = self.session.post(url, json=payload, timeout=300)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Chat API error ({resp.status_code}): {resp.text}")
+        resp = self._request_with_retry("POST", url, "Chat", json_payload=payload)
 
         data = resp.json()
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError):
-            raise RuntimeError(f"Unexpected chat response format: {data}")
+            raise RuntimeError(f"[Chat 错误] 意外的响应格式: {data}")
 
     # ------------------------------------------------------------------
     # Image Generation
@@ -200,20 +296,7 @@ class AgnesClient:
         n: int = 1,
         model: str = IMAGE_MODEL,
     ) -> List[Image.Image]:
-        """
-        Generate images via the Agnes image generation API.
-
-        Args:
-            prompt: Generation prompt.
-            mode: "text2img" or "img2img".
-            reference_images: List of PIL Images for img2img (as data URIs).
-            size: Output size, e.g. "1024x1024".
-            n: Number of images to generate (1-10).
-            model: Model identifier.
-
-        Returns:
-            List of generated PIL Images.
-        """
+        """Generate images via the Agnes image generation API."""
         url = f"{BASE_URL}/images/generations"
         payload = {
             "model": model,
@@ -229,9 +312,7 @@ class AgnesClient:
                 "response_format": "url",
             }
 
-        resp = self.session.post(url, json=payload, timeout=300)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Image API error ({resp.status_code}): {resp.text}")
+        resp = self._request_with_retry("POST", url, "Image", json_payload=payload)
 
         data = resp.json()
         images = []
@@ -241,6 +322,9 @@ class AgnesClient:
                 pil_img = download_url_to_pil(image_url)
                 if pil_img:
                     images.append(pil_img)
+
+        if not images:
+            raise RuntimeError("[Image 错误] 服务器未返回任何图片，请尝试修改提示词或重试。")
 
         return images
 
@@ -257,30 +341,28 @@ class AgnesClient:
         num_frames: int = DEFAULT_VIDEO_FRAMES,
         frame_rate: int = DEFAULT_VIDEO_FPS,
         seed: Optional[int] = None,
-        poll_interval: int = 10,
+        size: Optional[str] = None,
         max_wait: int = 600,
         output_dir: Optional[str] = None,
     ) -> Optional[str]:
         """
-        Generate a video via the Agnes video generation API (async).
+        Generate a video via the Agnes chat/completions API.
 
-        After submitting the task, this method polls until completion or timeout.
+        Video generation goes through the chat completions endpoint with the
+        video model. The response contains a video URL/base64 which we download.
 
         Args:
             prompt: Video description.
             mode: "text2video" or "img2video".
             reference_images: List of PIL Images for img2video.
-            model: Model identifier.
-            num_frames: Number of frames (must be 8n+1, max 441).
-            frame_rate: Frame rate (fps).
-            seed: Optional seed for reproducibility.
-            poll_interval: Seconds between status checks.
-            max_wait: Maximum seconds to wait for completion.
-            output_dir: Directory to save the video. Defaults to
-                        ComfyUI output dir or system temp dir.
-
-        Returns:
-            Local file path to the downloaded MP4 video, or None on failure.
+            model: Model identifier (agnes-video-v2).
+            num_frames: Desired frame count (embedded in prompt).
+            frame_rate: Desired frame rate (embedded in prompt).
+            seed: Optional seed (embedded in prompt).
+            size: Output resolution (embedded in prompt).
+            max_wait: Maximum wait for the HTTP request (video gen is synchronous
+                      but can take several minutes).
+            output_dir: Directory to save the video.
         """
         # Validate num_frames
         if (num_frames - 1) % 8 != 0:
@@ -288,84 +370,119 @@ class AgnesClient:
         if num_frames > 441:
             raise ValueError("num_frames must be <= 441")
 
-        # --- Submit task ---
-        url = f"{BASE_URL}/video/generations"
+        # --- Build the prompt with parameter hints ---
+        full_prompt = prompt
+        hints = []
+        if size:
+            hints.append(f"resolution: {size}")
+        hints.append(f"{num_frames} frames at {frame_rate}fps")
+        if seed:
+            hints.append(f"seed: {seed}")
+        if hints:
+            full_prompt = f"{prompt}\n\n[Technical specs: {', '.join(hints)}]"
+
+        # --- Build messages in OpenAI chat format ---
+        if mode == "img2video" and reference_images:
+            # Vision format with images
+            content_parts = []
+            for img in reference_images:
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": pil_to_base64_uri(img), "detail": "high"},
+                })
+            content_parts.append({"type": "text", "text": full_prompt})
+            messages = [{"role": "user", "content": content_parts}]
+        else:
+            messages = [{"role": "user", "content": full_prompt}]
+
+        # --- Call chat/completions ---
+        url = f"{BASE_URL}/chat/completions"
         payload = {
             "model": model,
-            "prompt": prompt,
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-            "response_format": "url",
+            "messages": messages,
+            "max_tokens": 4096,
         }
-        if seed is not None:
-            payload["seed"] = seed
 
-        if mode == "img2video" and reference_images:
-            image_uris = [pil_to_base64_uri(img) for img in reference_images]
-            payload["extra_body"] = {
-                "image": image_uris,
-            }
-
-        resp = self.session.post(url, json=payload, timeout=60)
-        if resp.status_code not in (200, 201, 202):
-            raise RuntimeError(f"Video submit error ({resp.status_code}): {resp.text}")
+        resp = self._request_with_retry("POST", url, "Video", json_payload=payload, timeout=max_wait)
 
         data = resp.json()
-        task_id = data.get("id") or data.get("task_id")
-        if not task_id:
-            raise RuntimeError(f"No task_id in submit response: {data}")
 
-        # --- Poll for result ---
-        status_url = f"{BASE_URL}/video/generations/{task_id}"
-        elapsed = 0
+        # --- Extract video from response ---
+        # The video model returns video data through the chat completions format.
+        # Try multiple possible locations for the video URL/base64.
 
-        while elapsed < max_wait:
-            time.sleep(poll_interval)
-            elapsed += poll_interval
+        video_url = None
+        video_b64 = None
 
-            status_resp = self.session.get(status_url, timeout=30)
-            if status_resp.status_code != 200:
-                continue
+        # 1. Check choices[0].message.content for URL
+        try:
+            content = data["choices"][0]["message"]["content"]
+            if content:
+                # Could be a direct URL or JSON with url field
+                content_stripped = content.strip()
+                if content_stripped.startswith("http"):
+                    video_url = content_stripped
+                elif content_stripped.startswith("{"):
+                    try:
+                        import json as _json
+                        content_data = _json.loads(content_stripped)
+                        video_url = content_data.get("url") or content_data.get("video_url")
+                        if not video_url and "data" in content_data:
+                            video_url = content_data["data"][0].get("url")
+                    except Exception:
+                        pass
+        except (KeyError, IndexError):
+            pass
 
-            status_data = status_resp.json()
-            state = status_data.get("status") or status_data.get("state")
-
-            if state in ("completed", "succeeded"):
-                video_url = None
-                # Try multiple response formats
-                for key in ("url", "video_url", "output_url"):
-                    if key in status_data:
-                        video_url = status_data[key]
+        # 2. Check top-level fields
+        if not video_url:
+            for key in ("url", "video_url", "output_url", "video"):
+                val = data.get(key)
+                if val and isinstance(val, str):
+                    if val.startswith("http"):
+                        video_url = val
                         break
-                if not video_url:
-                    data_items = status_data.get("data", [])
-                    if data_items:
-                        video_url = data_items[0].get("url")
+                    elif val.startswith("data:video") or len(val) > 1000:
+                        video_b64 = val
+                        break
 
+        # 3. Check data[] array
+        if not video_url and not video_b64:
+            for item in data.get("data", []):
+                video_url = item.get("url")
                 if video_url:
-                    video_bytes = download_url_to_bytes(video_url)
-                    if video_bytes:
-                        # Determine output directory
-                        if output_dir:
-                            save_dir = output_dir
-                        else:
-                            save_dir = tempfile.gettempdir()
+                    break
 
-                        os.makedirs(save_dir, exist_ok=True)
-                        timestamp = int(time.time())
-                        filename = f"agnes_video_{mode}_{timestamp}_{task_id[:8]}.mp4"
-                        save_path = os.path.join(save_dir, filename)
-                        with open(save_path, "wb") as f:
-                            f.write(video_bytes)
-                        return save_path
+        if not video_url and not video_b64:
+            raise RuntimeError(
+                "[Video 错误] 服务器未返回视频数据。\n"
+                f"响应原文: {str(data)[:500]}"
+            )
 
-                raise RuntimeError(f"Video completed but no downloadable URL found.")
+        # --- Download and save ---
+        save_dir = output_dir if output_dir else tempfile.gettempdir()
+        os.makedirs(save_dir, exist_ok=True)
+        timestamp = int(time.time())
+        filename = f"agnes_video_{mode}_{timestamp}.mp4"
+        save_path = os.path.join(save_dir, filename)
 
-            elif state in ("failed", "error"):
-                error_msg = status_data.get("error", "Unknown error")
-                raise RuntimeError(f"Video generation failed: {error_msg}")
+        if video_url:
+            video_bytes = download_url_to_bytes(video_url, timeout=120)
+        else:
+            # base64 data URI
+            import base64 as _b64
+            b64_data = video_b64
+            if b64_data.startswith("data:"):
+                b64_data = b64_data.split(",", 1)[1]
+            video_bytes = _b64.b64decode(b64_data)
 
-        raise TimeoutError(f"Video generation timed out after {max_wait}s (task: {task_id})")
+        if not video_bytes:
+            raise RuntimeError("[Video 错误] 视频下载失败。")
+
+        with open(save_path, "wb") as f:
+            f.write(video_bytes)
+
+        return save_path
 
     # ------------------------------------------------------------------
     # Image Understanding / Reverse Prompt (via vision chat)
