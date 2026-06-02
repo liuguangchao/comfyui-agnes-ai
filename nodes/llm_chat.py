@@ -24,7 +24,7 @@ class AgnesLLMChat:
             "required": {
                 "api_key": ("STRING", {
                     "multiline": False,
-                    "default": get_api_key(),
+                    "default": "",
                     "placeholder": "sk-...",
                     "tooltip": "Your Agnes AI API key from platform.agnes-ai.com",
                 }),

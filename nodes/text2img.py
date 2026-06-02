@@ -29,6 +29,7 @@ ASPECT_RATIOS = [
     "3:4",
     "4:5",
     "9:16",
+    "9:21",
     "3:2",
     "4:3",
     "5:4",
@@ -79,7 +80,7 @@ class AgnesTextToImage:
             "required": {
                 "api_key": ("STRING", {
                     "multiline": False,
-                    "default": get_api_key(),
+                    "default": "",
                     "placeholder": "sk-...",
                     "tooltip": "Your Agnes AI API key",
                 }),
