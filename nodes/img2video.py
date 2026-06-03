@@ -5,6 +5,8 @@ Generate videos from still images using Agnes AI video generation models.
 Supports multi-image input for keyframe-based animation.
 Uses async API with polling - can take several minutes.
 
+Supports quality (1K/2K) and aspect ratio selection.
+
 Output: Saves MP4 to ComfyUI's output/agnes_videos/ directory so users can
 preview and download from the web UI.
 """
@@ -22,8 +24,47 @@ from ..api import (
     tensor_to_pil,
 )
 
+# Quality → short-side pixels
+QUALITY_MAP = {
+    "1K": 1024,
+    "2K": 2048,
+}
+
+# Supported aspect ratios (width:height)
+ASPECT_RATIOS = [
+    "1:1",
+    "2:3",
+    "3:4",
+    "4:5",
+    "9:16",
+    "9:21",
+    "3:2",
+    "4:3",
+    "5:4",
+    "16:9",
+    "21:9",
+]
+
 # Try to get ComfyUI's output directory (available inside ComfyUI runtime).
 _COMFYUI_OUTPUT_DIR = None
+
+
+def compute_size(quality: str, aspect_ratio: str) -> str:
+    """Compute a WxH pixel size string from quality level and aspect ratio."""
+    base = QUALITY_MAP.get(quality, 1024)
+    w_ratio, h_ratio = map(int, aspect_ratio.split(":"))
+
+    if w_ratio >= h_ratio:
+        height = base
+        width = base * w_ratio // h_ratio
+    else:
+        width = base
+        height = base * h_ratio // w_ratio
+
+    width = max(64, (width // 8) * 8)
+    height = max(64, (height // 8) * 8)
+
+    return f"{width}x{height}"
 
 
 def _get_output_dir() -> str:
@@ -32,24 +73,47 @@ def _get_output_dir() -> str:
     if _COMFYUI_OUTPUT_DIR is not None:
         return _COMFYUI_OUTPUT_DIR
 
-    # Try the standard ComfyUI way first
     try:
         from folder_paths import get_output_directory
         base = get_output_directory()
     except ImportError:
-        # Fallback: use plugin-relative or temp
         base = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
 
     _COMFYUI_OUTPUT_DIR = os.path.join(base, "agnes_videos")
     return _COMFYUI_OUTPUT_DIR
 
 
+# Detect video output type (priority: comfy_api VIDEO > VHS > STRING).
+_VIDEO_OUTPUT_TYPE = "STRING"
+_VIDEO_MODE = "string"  # "comfy_api" | "vhs" | "string"
+
+# 1. Try native VIDEO type from comfy_api (ships with ComfyUI v1.7+)
+try:
+    from comfy_api.latest import InputImpl as _ApiInput
+    if hasattr(_ApiInput, "VideoFromFile"):
+        _VIDEO_OUTPUT_TYPE = "VIDEO"
+        _VIDEO_MODE = "comfy_api"
+except Exception:
+    pass
+
+# 2. Fallback to VHS_VIDEOINFO
+if _VIDEO_MODE == "string":
+    try:
+        import nodes as _comfy_nodes
+        if hasattr(_comfy_nodes, "NODE_CLASS_MAPPINGS"):
+            if "VHS_VIDEOINFO" in str(_comfy_nodes.NODE_CLASS_MAPPINGS):
+                _VIDEO_OUTPUT_TYPE = "VHS_VIDEOINFO"
+                _VIDEO_MODE = "vhs"
+    except Exception:
+        pass
+
+
 class AgnesImageToVideo:
     """Agnes AI Image-to-Video node for ComfyUI."""
 
     CATEGORY = "Agnes AI"
-    RETURN_TYPES = ("STRING", "STRING",)
-    RETURN_NAMES = ("video_path", "filename",)
+    RETURN_TYPES = (_VIDEO_OUTPUT_TYPE, "STRING",)
+    RETURN_NAMES = ("video", "resolution",)
     FUNCTION = "generate"
 
     @classmethod
@@ -74,6 +138,14 @@ class AgnesImageToVideo:
                 "model": (AVAILABLE_VIDEO_MODELS, {
                     "default": VIDEO_MODEL,
                     "tooltip": "Video generation model",
+                }),
+                "quality": (["1K", "2K"], {
+                    "default": "1K",
+                    "tooltip": "Video quality / short-side resolution. 1K=1024px, 2K=2048px",
+                }),
+                "aspect_ratio": (ASPECT_RATIOS, {
+                    "default": "16:9",
+                    "tooltip": "Output aspect ratio (width:height). E.g. 16:9 for widescreen, 9:16 for portrait",
                 }),
                 "num_frames": ("INT", {
                     "default": DEFAULT_VIDEO_FRAMES,
@@ -117,20 +189,23 @@ class AgnesImageToVideo:
         image,
         prompt: str,
         model: str = VIDEO_MODEL,
+        quality: str = "1K",
+        aspect_ratio: str = "16:9",
         num_frames: int = DEFAULT_VIDEO_FRAMES,
         frame_rate: int = DEFAULT_VIDEO_FPS,
         seed: int = 0,
         max_wait_seconds: int = 600,
         end_frame_image=None,
-    ) -> Tuple[str, str]:
+    ) -> Tuple:
         # Runtime fallback: try config file if widget value is empty
         if not api_key.strip():
             api_key = get_api_key()
         if not api_key.strip():
-            return ("[Error: API key is required]", "")
+            return _error("API key is required")
         if not prompt.strip():
-            return ("[Error: Prompt is empty]", "")
+            return _error("Prompt is empty")
 
+        size = compute_size(quality, aspect_ratio)
         output_dir = _get_output_dir()
 
         try:
@@ -148,14 +223,40 @@ class AgnesImageToVideo:
                 num_frames=num_frames,
                 frame_rate=frame_rate,
                 seed=seed if seed > 0 else None,
+                size=size,
                 max_wait=max_wait_seconds,
                 output_dir=output_dir,
             )
 
             if video_path:
-                filename = os.path.basename(video_path)
-                return (video_path, filename)
-            return ("[Error: No video returned]", "")
+                return _make_result(video_path, size)
+            return _error("No video returned", size)
 
         except Exception as e:
-            return (f"[Error] {str(e)}", "")
+            return _error(str(e), size)
+
+
+# ---- Result builders (shared) ----
+
+def _make_result(video_path: str, size: str) -> Tuple:
+    """Build a (video_output, resolution) tuple based on available output type."""
+    filename = os.path.basename(video_path)
+
+    if _VIDEO_MODE == "comfy_api":
+        video_output = _ApiInput.VideoFromFile(video_path)
+        return (video_output, size)
+
+    if _VIDEO_MODE == "vhs":
+        return ({"filename": filename, "subfolder": "agnes_videos", "type": "output"}, size)
+
+    return (video_path, size)
+
+
+def _error(msg: str, size: str = "") -> Tuple:
+    """Build an error. Raises in comfy_api VIDEO mode (string would crash SaveVideo)."""
+    text = f"[Error] {msg}"
+    if _VIDEO_MODE == "comfy_api":
+        raise RuntimeError(text)
+    if _VIDEO_MODE == "vhs":
+        return ({"filename": "", "subfolder": "", "type": "output"}, text)
+    return (text, text) if not size else (text, size)

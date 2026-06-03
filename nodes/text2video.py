@@ -83,12 +83,37 @@ def _get_output_dir() -> str:
     return _COMFYUI_OUTPUT_DIR
 
 
+# Detect video output type (priority: comfy_api VIDEO > VHS > STRING).
+_VIDEO_OUTPUT_TYPE = "STRING"
+_VIDEO_MODE = "string"  # "comfy_api" | "vhs" | "string"
+
+# 1. Try native VIDEO type from comfy_api (ships with ComfyUI v1.7+)
+try:
+    from comfy_api.latest import InputImpl as _ApiInput
+    if hasattr(_ApiInput, "VideoFromFile"):
+        _VIDEO_OUTPUT_TYPE = "VIDEO"
+        _VIDEO_MODE = "comfy_api"
+except Exception:
+    pass
+
+# 2. Fallback to VHS_VIDEOINFO
+if _VIDEO_MODE == "string":
+    try:
+        import nodes as _comfy_nodes
+        if hasattr(_comfy_nodes, "NODE_CLASS_MAPPINGS"):
+            if "VHS_VIDEOINFO" in str(_comfy_nodes.NODE_CLASS_MAPPINGS):
+                _VIDEO_OUTPUT_TYPE = "VHS_VIDEOINFO"
+                _VIDEO_MODE = "vhs"
+    except Exception:
+        pass
+
+
 class AgnesTextToVideo:
     """Agnes AI Text-to-Video node for ComfyUI."""
 
     CATEGORY = "Agnes AI"
-    RETURN_TYPES = ("STRING", "STRING", "STRING",)
-    RETURN_NAMES = ("video_path", "filename", "resolution",)
+    RETURN_TYPES = (_VIDEO_OUTPUT_TYPE, "STRING",)
+    RETURN_NAMES = ("video", "resolution",)
     FUNCTION = "generate"
 
     @classmethod
@@ -161,15 +186,15 @@ class AgnesTextToVideo:
         frame_rate: int = DEFAULT_VIDEO_FPS,
         seed: int = 0,
         max_wait_seconds: int = 600,
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple:
         if not prompt.strip():
-            return ("[Error: Prompt is empty]", "", "")
+            return _error("Prompt is empty")
 
         # Runtime fallback: try config file if widget value is empty
         if not api_key.strip():
             api_key = get_api_key()
         if not api_key.strip():
-            return ("[Error: API key is required]", "", "")
+            return _error("API key is required")
 
         size = compute_size(quality, aspect_ratio)
         output_dir = _get_output_dir()
@@ -189,9 +214,37 @@ class AgnesTextToVideo:
             )
 
             if video_path:
-                filename = os.path.basename(video_path)
-                return (video_path, filename, size)
-            return ("[Error: No video returned]", "", size)
+                return _make_result(video_path, size)
+            return _error("No video returned", size)
 
         except Exception as e:
-            return (f"[Error] {str(e)}", "", size)
+            return _error(str(e), size)
+
+
+# ---- Result builders (shared) ----
+
+def _make_result(video_path: str, size: str) -> Tuple:
+    """Build a (video_output, resolution) tuple based on available output type."""
+    filename = os.path.basename(video_path)
+
+    if _VIDEO_MODE == "comfy_api":
+        # Native VIDEO type: return VideoFromFile
+        video_output = _ApiInput.VideoFromFile(video_path)
+        return (video_output, size)
+
+    if _VIDEO_MODE == "vhs":
+        # VHS_VIDEOINFO dict
+        return ({"filename": filename, "subfolder": "agnes_videos", "type": "output"}, size)
+
+    # String fallback
+    return (video_path, size)
+
+
+def _error(msg: str, size: str = "") -> Tuple:
+    """Build an error. Raises in comfy_api VIDEO mode (string would crash SaveVideo)."""
+    text = f"[Error] {msg}"
+    if _VIDEO_MODE == "comfy_api":
+        raise RuntimeError(text)
+    if _VIDEO_MODE == "vhs":
+        return ({"filename": "", "subfolder": "", "type": "output"}, text)
+    return (text, text) if not size else (text, size)

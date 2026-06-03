@@ -55,7 +55,7 @@ BASE_URL = "https://apihub.agnes-ai.com/v1"
 
 CHAT_MODEL = "agnes-2.0-flash"
 IMAGE_MODEL = "agnes-image-2.1-flash"
-VIDEO_MODEL = "agnes-video-v2"
+VIDEO_MODEL = "agnes-video-v2.0"
 
 DEFAULT_SIZE = "1024x1024"
 DEFAULT_VIDEO_FRAMES = 121
@@ -104,9 +104,25 @@ def pil_to_base64_uri(pil_img: Image.Image, fmt: str = "png") -> str:
     """Convert a PIL Image to a base64 data URI string."""
     buf = BytesIO()
     pil_img.save(buf, format=fmt.upper())
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    raw = buf.getvalue()
+    b64 = base64.b64encode(raw).decode("ascii")
+    # Safety: ensure padding is correct (b64encode already pads, but belt-and-suspenders)
+    pad = len(b64) % 4
+    if pad:
+        b64 += "=" * (4 - pad)
     mime = MIME_MAP.get(fmt.lower(), "image/png")
     return f"data:{mime};base64,{b64}"
+
+
+def pil_to_base64_raw(pil_img: Image.Image, fmt: str = "png") -> str:
+    """Convert a PIL Image to raw base64 string (no data URI prefix)."""
+    buf = BytesIO()
+    pil_img.save(buf, format=fmt.upper())
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    pad = len(b64) % 4
+    if pad:
+        b64 += "=" * (4 - pad)
+    return b64
 
 
 def download_url_to_pil(url: str, timeout: int = 120) -> Optional[Image.Image]:
@@ -346,22 +362,20 @@ class AgnesClient:
         output_dir: Optional[str] = None,
     ) -> Optional[str]:
         """
-        Generate a video via the Agnes chat/completions API.
+        Generate a video via the Agnes video generation API.
 
-        Video generation goes through the chat completions endpoint with the
-        video model. The response contains a video URL/base64 which we download.
+        Endpoint: POST /v1/videos  →  GET /v1/videos/{task_id} (async polling)
 
         Args:
             prompt: Video description.
             mode: "text2video" or "img2video".
             reference_images: List of PIL Images for img2video.
-            model: Model identifier (agnes-video-v2).
-            num_frames: Desired frame count (embedded in prompt).
-            frame_rate: Desired frame rate (embedded in prompt).
-            seed: Optional seed (embedded in prompt).
-            size: Output resolution (embedded in prompt).
-            max_wait: Maximum wait for the HTTP request (video gen is synchronous
-                      but can take several minutes).
+            model: Model identifier (agnes-video-v2.0).
+            num_frames: Frame count (must be 8n+1, max 441).
+            frame_rate: Frame rate (fps).
+            seed: Optional random seed.
+            size: Output resolution as "WxH" string, e.g. "1152x768".
+            max_wait: Maximum seconds to wait for completion.
             output_dir: Directory to save the video.
         """
         # Validate num_frames
@@ -370,119 +384,144 @@ class AgnesClient:
         if num_frames > 441:
             raise ValueError("num_frames must be <= 441")
 
-        # --- Build the prompt with parameter hints ---
-        full_prompt = prompt
-        hints = []
+        # --- Parse size into width/height ---
+        width = None
+        height = None
         if size:
-            hints.append(f"resolution: {size}")
-        hints.append(f"{num_frames} frames at {frame_rate}fps")
-        if seed:
-            hints.append(f"seed: {seed}")
-        if hints:
-            full_prompt = f"{prompt}\n\n[Technical specs: {', '.join(hints)}]"
+            try:
+                parts = size.split("x")
+                width = int(parts[0])
+                height = int(parts[1])
+            except (ValueError, IndexError):
+                pass  # fall through, API will use defaults
 
-        # --- Build messages in OpenAI chat format ---
-        if mode == "img2video" and reference_images:
-            # Vision format with images
-            content_parts = []
-            for img in reference_images:
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {"url": pil_to_base64_uri(img), "detail": "high"},
-                })
-            content_parts.append({"type": "text", "text": full_prompt})
-            messages = [{"role": "user", "content": content_parts}]
-        else:
-            messages = [{"role": "user", "content": full_prompt}]
-
-        # --- Call chat/completions ---
-        url = f"{BASE_URL}/chat/completions"
-        payload = {
+        # --- Build submission payload ---
+        url = f"{BASE_URL}/videos"
+        payload: Dict[str, Any] = {
             "model": model,
-            "messages": messages,
-            "max_tokens": 4096,
+            "prompt": prompt,
+            "num_frames": num_frames,
+            "frame_rate": frame_rate,
         }
+        if width is not None:
+            payload["width"] = width
+        if height is not None:
+            payload["height"] = height
+        if seed is not None:
+            payload["seed"] = seed
 
-        resp = self._request_with_retry("POST", url, "Video", json_payload=payload, timeout=max_wait)
+        # Image-to-video: single image or multi-image via extra_body
+        if mode == "img2video" and reference_images:
+            image_uris = [pil_to_base64_raw(img) for img in reference_images]
+            if len(image_uris) == 1:
+                payload["image"] = image_uris[0]
+            else:
+                payload["extra_body"] = {
+                    "image": image_uris,
+                }
 
+        # --- Submit task ---
+        resp = self._request_with_retry("POST", url, "Video", json_payload=payload, timeout=60)
         data = resp.json()
 
-        # --- Extract video from response ---
-        # The video model returns video data through the chat completions format.
-        # Try multiple possible locations for the video URL/base64.
+        task_id = data.get("id")
+        if not task_id:
+            raise RuntimeError(f"[Video 错误] 服务器未返回任务ID: {data}")
 
-        video_url = None
-        video_b64 = None
+        # --- Poll for result ---
+        status_url = f"{BASE_URL}/videos/{task_id}"
+        poll_interval = 10
+        elapsed = 0
 
-        # 1. Check choices[0].message.content for URL
-        try:
-            content = data["choices"][0]["message"]["content"]
-            if content:
-                # Could be a direct URL or JSON with url field
-                content_stripped = content.strip()
-                if content_stripped.startswith("http"):
-                    video_url = content_stripped
-                elif content_stripped.startswith("{"):
-                    try:
-                        import json as _json
-                        content_data = _json.loads(content_stripped)
-                        video_url = content_data.get("url") or content_data.get("video_url")
-                        if not video_url and "data" in content_data:
-                            video_url = content_data["data"][0].get("url")
-                    except Exception:
-                        pass
-        except (KeyError, IndexError):
-            pass
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
 
-        # 2. Check top-level fields
-        if not video_url:
-            for key in ("url", "video_url", "output_url", "video"):
-                val = data.get(key)
-                if val and isinstance(val, str):
-                    if val.startswith("http"):
+            try:
+                status_resp = self.session.get(status_url, timeout=30)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                continue
+
+            if status_resp.status_code != 200:
+                continue
+
+            status_data = status_resp.json()
+            state = status_data.get("status")
+
+            if state == "completed":
+                # Try multiple possible locations for the video URL
+                video_url = None
+                for key in ("video_url", "url", "output_url", "download_url", "remixed_from_video_id"):
+                    val = status_data.get(key)
+                    if val and isinstance(val, str) and val.startswith("http"):
                         video_url = val
                         break
-                    elif val.startswith("data:video") or len(val) > 1000:
-                        video_b64 = val
-                        break
+                if not video_url:
+                    # Check data array
+                    for item in status_data.get("data", []):
+                        for key in ("url", "video_url"):
+                            val = item.get(key)
+                            if val and isinstance(val, str) and val.startswith("http"):
+                                video_url = val
+                                break
+                        if video_url:
+                            break
+                if not video_url:
+                    # Check result/output sub-object
+                    for sub in ("result", "output"):
+                        obj = status_data.get(sub, {})
+                        if isinstance(obj, dict):
+                            for key in ("video_url", "url"):
+                                val = obj.get(key)
+                                if val and isinstance(val, str) and val.startswith("http"):
+                                    video_url = val
+                                    break
+                        if video_url:
+                            break
 
-        # 3. Check data[] array
-        if not video_url and not video_b64:
-            for item in data.get("data", []):
-                video_url = item.get("url")
-                if video_url:
-                    break
+                if not video_url:
+                    # Dump raw response for debugging
+                    resp_dump = str(status_data)
+                    if len(resp_dump) > 600:
+                        resp_dump = resp_dump[:600] + "..."
+                    raise RuntimeError(
+                        f"[Video 错误] 任务状态为 completed，但未找到 video_url。\n"
+                        f"API 原始响应: {resp_dump}"
+                    )
 
-        if not video_url and not video_b64:
-            raise RuntimeError(
-                "[Video 错误] 服务器未返回视频数据。\n"
-                f"响应原文: {str(data)[:500]}"
-            )
+                # Download and save
+                video_bytes = download_url_to_bytes(video_url, timeout=120)
+                if not video_bytes:
+                    raise RuntimeError("[Video 错误] 视频文件下载失败。")
 
-        # --- Download and save ---
-        save_dir = output_dir if output_dir else tempfile.gettempdir()
-        os.makedirs(save_dir, exist_ok=True)
-        timestamp = int(time.time())
-        filename = f"agnes_video_{mode}_{timestamp}.mp4"
-        save_path = os.path.join(save_dir, filename)
+                save_dir = output_dir if output_dir else tempfile.gettempdir()
+                os.makedirs(save_dir, exist_ok=True)
+                timestamp = int(time.time())
+                filename = f"agnes_video_{mode}_{timestamp}_{task_id[:8]}.mp4"
+                save_path = os.path.join(save_dir, filename)
+                with open(save_path, "wb") as f:
+                    f.write(video_bytes)
 
-        if video_url:
-            video_bytes = download_url_to_bytes(video_url, timeout=120)
-        else:
-            # base64 data URI
-            import base64 as _b64
-            b64_data = video_b64
-            if b64_data.startswith("data:"):
-                b64_data = b64_data.split(",", 1)[1]
-            video_bytes = _b64.b64decode(b64_data)
+                return save_path
 
-        if not video_bytes:
-            raise RuntimeError("[Video 错误] 视频下载失败。")
+            elif state in ("failed", "error"):
+                error_msg = status_data.get("error", "Unknown error")
+                # Clean up nested error dicts
+                if isinstance(error_msg, dict):
+                    error_msg = error_msg.get("message", str(error_msg))
+                # Detect common server errors for user-friendly advice
+                hint = ""
+                error_lower = str(error_msg).lower()
+                if "cuda out of memory" in error_lower or "oom" in error_lower:
+                    hint = "\n原因：Agnes 服务器 GPU 显存不足，当前排队人数较多。\n建议：降低画质（1K）或减少帧数后重试。"
+                elif "no available channel" in error_lower or "503" in error_lower:
+                    hint = "\n原因：Agnes 视频模型无可用计算节点。\n建议：稍等 2-5 分钟后重试。"
+                raise RuntimeError(f"[Video 错误] 视频生成失败: {error_msg}{hint}")
 
-        with open(save_path, "wb") as f:
-            f.write(video_bytes)
-
-        return save_path
+        raise TimeoutError(
+            f"[Video 错误] 视频生成超时（已等待 {max_wait} 秒，任务ID: {task_id}）。\n"
+            f"建议：减少帧数或稍后重试。"
+        )
 
     # ------------------------------------------------------------------
     # Image Understanding / Reverse Prompt (via vision chat)
