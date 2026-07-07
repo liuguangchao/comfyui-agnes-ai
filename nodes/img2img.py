@@ -69,7 +69,7 @@ def compute_size(quality: str, aspect_ratio: str) -> str:
 class AgnesImageToImage:
     """Agnes AI Image-to-Image (Image Editing) node for ComfyUI."""
 
-    CATEGORY = "Agnes AI"
+    CATEGORY = "Agnes AI2"
     RETURN_TYPES = ("IMAGE", "STRING",)
     RETURN_NAMES = ("images", "resolution",)
     FUNCTION = "edit"

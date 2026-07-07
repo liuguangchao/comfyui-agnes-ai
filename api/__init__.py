@@ -360,6 +360,8 @@ class AgnesClient:
         size: Optional[str] = None,
         max_wait: int = 600,
         output_dir: Optional[str] = None,
+        num_inference_steps: int = 25,
+        negative_prompt: Optional[str] = None,
     ) -> Optional[str]:
         """
         Generate a video via the Agnes video generation API.
@@ -402,6 +404,8 @@ class AgnesClient:
             "prompt": prompt,
             "num_frames": num_frames,
             "frame_rate": frame_rate,
+            "num_inference_steps": num_inference_steps,
+
         }
         if width is not None:
             payload["width"] = width
@@ -409,6 +413,8 @@ class AgnesClient:
             payload["height"] = height
         if seed is not None:
             payload["seed"] = seed
+        if negative_prompt is not None:
+            payload["negative_prompt"] = negative_prompt
 
         # Image-to-video: single image or multi-image via extra_body
         if mode == "img2video" and reference_images:
@@ -418,7 +424,9 @@ class AgnesClient:
             else:
                 payload["extra_body"] = {
                     "image": image_uris,
+                    "mode": "keyframes",
                 }
+                payload["mode"]="keyframes"
 
         # --- Submit task ---
         resp = self._request_with_retry("POST", url, "Video", json_payload=payload, timeout=60)

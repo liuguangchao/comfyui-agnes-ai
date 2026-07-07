@@ -111,7 +111,7 @@ if _VIDEO_MODE == "string":
 class AgnesImageToVideo:
     """Agnes AI Image-to-Video node for ComfyUI."""
 
-    CATEGORY = "Agnes AI"
+    CATEGORY = "Agnes AI2"
     RETURN_TYPES = (_VIDEO_OUTPUT_TYPE, "STRING",)
     RETURN_NAMES = ("video", "resolution",)
     FUNCTION = "generate"
@@ -126,7 +126,7 @@ class AgnesImageToVideo:
                     "placeholder": "sk-...",
                     "tooltip": "Your Agnes AI API key",
                 }),
-                "image": ("IMAGE", {
+                "image1": ("IMAGE", {
                     "tooltip": "Primary input image to animate",
                 }),
                 "prompt": ("STRING", {
@@ -177,8 +177,42 @@ class AgnesImageToVideo:
                 }),
             },
             "optional": {
-                "end_frame_image": ("IMAGE", {
+                "image2": ("IMAGE", {
                     "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }),
+                "image3": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }),
+                "image4": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }), 
+                "image5": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }), 
+                "image6": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }), 
+                "image7": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }), 
+                "image8": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }), 
+                "image9": ("IMAGE", {
+                    "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
+                }), 
+                "negative_prompt": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "Negative prompt...",
+                    "tooltip": "Negative prompt for image-to-video generation",
+                }),
+                "num_inference_steps": ("INT", {
+                    "default": 25,
+                    "min": 1,
+                    "max": 50,
+                    "step": 1,
+                    "tooltip": "Number of inference steps for image-to-video generation",
                 }),
             },
         }
@@ -186,7 +220,7 @@ class AgnesImageToVideo:
     def generate(
         self,
         api_key: str,
-        image,
+        image1,
         prompt: str,
         model: str = VIDEO_MODEL,
         quality: str = "1K",
@@ -195,7 +229,16 @@ class AgnesImageToVideo:
         frame_rate: int = DEFAULT_VIDEO_FPS,
         seed: int = 0,
         max_wait_seconds: int = 600,
-        end_frame_image=None,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
+        image6=None,
+        image7=None,
+        image8=None,
+        image9=None,
+        negative_prompt=None,
+        num_inference_steps: int = 25,
     ) -> Tuple:
         # Runtime fallback: try config file if widget value is empty
         if not api_key.strip():
@@ -210,9 +253,23 @@ class AgnesImageToVideo:
 
         try:
             # Collect reference images
-            ref_imgs = [tensor_to_pil(image)]
-            if end_frame_image is not None:
-                ref_imgs.append(tensor_to_pil(end_frame_image))
+            ref_imgs = [tensor_to_pil(image1)]
+            if image2 is not None:
+                ref_imgs.append(tensor_to_pil(image2))
+            if image3 is not None:
+                ref_imgs.append(tensor_to_pil(image3))
+            if image4 is not None:
+                ref_imgs.append(tensor_to_pil(image4))
+            if image5 is not None:
+                ref_imgs.append(tensor_to_pil(image5))
+            if image6 is not None:
+                ref_imgs.append(tensor_to_pil(image6))
+            if image7 is not None:
+                ref_imgs.append(tensor_to_pil(image7))
+            if image8 is not None:
+                ref_imgs.append(tensor_to_pil(image8))
+            if image9 is not None:
+                ref_imgs.append(tensor_to_pil(image9))
 
             client = AgnesClient(api_key)
             video_path = client.generate_video(
@@ -226,6 +283,8 @@ class AgnesImageToVideo:
                 size=size,
                 max_wait=max_wait_seconds,
                 output_dir=output_dir,
+                num_inference_steps=num_inference_steps,
+                negative_prompt=negative_prompt,
             )
 
             if video_path:

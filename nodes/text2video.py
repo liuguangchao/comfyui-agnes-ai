@@ -111,7 +111,7 @@ if _VIDEO_MODE == "string":
 class AgnesTextToVideo:
     """Agnes AI Text-to-Video node for ComfyUI."""
 
-    CATEGORY = "Agnes AI"
+    CATEGORY = "Agnes AI2"
     RETURN_TYPES = (_VIDEO_OUTPUT_TYPE, "STRING",)
     RETURN_NAMES = ("video", "resolution",)
     FUNCTION = "generate"

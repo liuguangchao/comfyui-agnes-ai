@@ -19,7 +19,7 @@ CONFIG_FILE = os.path.join(PLUGIN_DIR, "api_key_config.json")
 class AgnesAPIKeyConfig:
     """Persist Agnes API key to a local config file for all nodes to share."""
 
-    CATEGORY = "Agnes AI"
+    CATEGORY = "Agnes AI2"
     RETURN_TYPES = ("STRING", "STRING")
     RETURN_NAMES = ("status", "masked_key")
     FUNCTION = "save_key"

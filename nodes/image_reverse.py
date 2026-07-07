@@ -13,7 +13,7 @@ from ..api import AgnesClient, get_api_key, CHAT_MODEL, AVAILABLE_CHAT_MODELS, t
 class AgnesImageReverse:
     """Agnes AI Image Reverse Prompt node - generates prompts from images."""
 
-    CATEGORY = "Agnes AI"
+    CATEGORY = "Agnes AI2"
     RETURN_TYPES = ("STRING", "STRING",)
     RETURN_NAMES = ("prompt", "brief_prompt",)
     FUNCTION = "reverse"

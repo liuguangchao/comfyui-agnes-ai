@@ -13,7 +13,7 @@ from ..api import AgnesClient, get_api_key, CHAT_MODEL, AVAILABLE_CHAT_MODELS
 class AgnesLLMChat:
     """Agnes AI LLM Chat node for ComfyUI."""
 
-    CATEGORY = "Agnes AI"
+    CATEGORY = "Agnes AI2"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("response",)
     FUNCTION = "chat"
