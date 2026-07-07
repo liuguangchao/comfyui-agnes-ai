@@ -202,10 +202,10 @@ class AgnesImageToVideo:
                     "tooltip": "Optional end frame for keyframe-based animation (image -> image transition)",
                 }), 
                 "negative_prompt": ("STRING", {
-                    "multiline": False,
+                    "multiline": True,
                     "default": "",
-                    "placeholder": "Negative prompt...",
-                    "tooltip": "Negative prompt for image-to-video generation",
+                    "placeholder": "负向提示词",
+                    "tooltip": "负向提示词",
                 }),
                 "num_inference_steps": ("INT", {
                     "default": 25,
@@ -284,7 +284,8 @@ class AgnesImageToVideo:
                 max_wait=max_wait_seconds,
                 output_dir=output_dir,
                 num_inference_steps=num_inference_steps,
-                negative_prompt=negative_prompt,
+                negative_prompt=negative_prompt.strip()
+,
             )
 
             if video_path:
