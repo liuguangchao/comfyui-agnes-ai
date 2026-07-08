@@ -144,7 +144,7 @@ class AgnesImageToVideo:
                     "tooltip": "Video quality / short-side resolution. 1K=1024px, 2K=2048px",
                 }),
                 "aspect_ratio": (ASPECT_RATIOS, {
-                    "default": "16:9",
+                    "default": "9:16",
                     "tooltip": "Output aspect ratio (width:height). E.g. 16:9 for widescreen, 9:16 for portrait",
                 }),
                 "time_seconds": ("INT", {
@@ -224,7 +224,7 @@ class AgnesImageToVideo:
         prompt: str,
         model: str = VIDEO_MODEL,
         quality: str = "1K",
-        aspect_ratio: str = "16:9",
+        aspect_ratio: str = "9:16",
         time_seconds: int = 5,
         frame_rate: int = DEFAULT_VIDEO_FPS,
         seed: int = 0,
